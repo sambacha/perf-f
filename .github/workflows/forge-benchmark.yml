@@ -1,0 +1,79 @@
+name: Forge Benchmarks
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/forge-benchmark.yml
+      - forge_versions.csv
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse CSV and build matrix
+        id: set-matrix
+        run: |
+          # Extract month + download URL
+          matrix=$(awk -F, '
+            NR > 1 {
+              split($1, d, "-");
+              month = d[1] "-" d[2];
+              gsub(/"/, "", $2);
+              urls[month] = $2
+            }
+            END {
+              printf "["
+              first = 1
+              for (m in urls) {
+                if (!first) printf ","
+                printf "{\"month\":\"%s\",\"url\":\"%s\"}", m, urls[m]
+                first = 0
+              }
+              print "]"
+            }
+          ' forge_versions.csv)
+          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+
+  benchmark:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    name: Benchmark ${{ matrix.month }}
+    steps:
+      - name: Checkout Solady
+        uses: actions/checkout@v4
+        with:
+          repository: Vectorized/solady
+          path: solady
+
+      - name: Install foundryup (optional fallback)
+        run: curl -L https://foundry.paradigm.xyz | bash
+
+      - name: Download forge binary
+        run: |
+          curl -L "${{ matrix.url }}" -o forge.tar.gz
+          mkdir -p forge-bin
+          tar -xzf forge.tar.gz -C forge-bin
+          chmod +x forge-bin/forge
+          echo "$(pwd)/forge-bin" >> $GITHUB_PATH
+
+      - name: Run benchmark
+        working-directory: solady
+        run: |
+          start=$(date +%s%N)
+          forge build >/dev/null 2>&1
+          end=$(date +%s%N)
+          duration=$(( (end - start) / 1000000 ))
+          echo "Forge version from ${{ matrix.month }} took $duration ms to compile Solady"
+
+      - name: Upload benchmark result
+        run: echo "${{ matrix.month }},$duration" >> $GITHUB_STEP_SUMMARY
