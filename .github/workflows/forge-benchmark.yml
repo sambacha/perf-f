@@ -20,26 +20,31 @@ jobs:
       - name: Parse CSV and build matrix
         id: set-matrix
         run: |
-          # Extract month + download URL
-          matrix=$(awk -F, '
-            NR > 1 {
+          echo "::group::Parsing forge_versions.csv"
+          matrix=$(tail -n +2 forge_versions.csv | awk -F, '
+            {
+              gsub(/"/, "", $1);
+              gsub(/"/, "", $2);
               split($1, d, "-");
               month = d[1] "-" d[2];
-              gsub(/"/, "", $2);
-              urls[month] = $2
+              url = $2;
+              seen[month] = url;
             }
             END {
-              printf "["
-              first = 1
-              for (m in urls) {
-                if (!first) printf ","
-                printf "{\"month\":\"%s\",\"url\":\"%s\"}", m, urls[m]
-                first = 0
+              print "[";
+              first = 1;
+              for (month in seen) {
+                if (!first) print ",";
+                printf("{\"month\":\"%s\",\"url\":\"%s\"}", month, seen[month]);
+                first = 0;
               }
-              print "]"
+              print "]";
             }
-          ' forge_versions.csv)
+          ')
+          echo "$matrix" | jq . > /dev/null || { echo "Invalid matrix JSON"; exit 1; }
           echo "matrix=$matrix" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+
 
   benchmark:
     needs: prepare
