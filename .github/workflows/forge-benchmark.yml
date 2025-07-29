@@ -32,17 +32,25 @@ jobs:
             }
             END {
               print "[";
-              first = 1;
+              count = 0;
+              for (month in seen) count++;
+              i = 0;
               for (month in seen) {
-                if (!first) print ",";
-                printf("{\"month\":\"%s\",\"url\":\"%s\"}", month, seen[month]);
-                first = 0;
+                printf "  {\"month\":\"%s\",\"url\":\"%s\"}", month, seen[month];
+                if (++i < count) print ",";
+                else print "";
               }
               print "]";
             }
           ')
-          echo "$matrix" | jq . > /dev/null || { echo "Invalid matrix JSON"; exit 1; }
-          echo "matrix=$matrix" >> $GITHUB_OUTPUT
+          
+          echo "Parsed matrix:"
+          echo "$matrix"
+          echo "$matrix" | jq . > /dev/null || { echo "❌ Invalid matrix JSON"; exit 1; }
+          
+          # GitHub Actions output (escaped for multiline JSON)
+          matrix_json="${matrix//$'\n'/}"
+          echo "matrix=$matrix_json" >> $GITHUB_OUTPUT
           echo "::endgroup::"
 
 
