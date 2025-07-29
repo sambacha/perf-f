@@ -1,0 +1,121 @@
+name: Compare Forge Compile Times
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compare-compile-times:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+    - name: Checkout Solady
+      uses: actions/checkout@v4
+      with:
+        repository: Vectorized/solady
+        path: solady
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y bc curl jq
+
+    - name: Get old Forge version
+      id: old-version
+      run: |
+        # Calculate date one year ago
+        cutoff_date=$(date -d "1 year ago" +%Y-%m-%d)
+        echo "Cutoff date: $cutoff_date"
+        
+        # Get all tags and their creation dates
+        curl -s https://api.github.com/repos/foundry-rs/foundry/tags | \
+          jq -r '.[] | select(.name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")) | [.name, .commit.commit.committer.date] | @tsv' > tags.txt
+        
+        # Find latest tag before cutoff date
+        while IFS=$'\t' read -r tag date; do
+          tag_date=$(date -d "$date" +%Y-%m-%d)
+          if [[ "$tag_date" < "$cutoff_date" || "$tag_date" == "$cutoff_date" ]]; then
+            echo "Found candidate: $tag ($tag_date)"
+            echo "old_version=$tag" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+        done < <(sort -r tags.txt)
+        
+        # Fallback if no tag found
+        if [ -z "$old_version" ]; then
+          echo "old_version=v0.2.0" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Setup old Forge
+      id: setup-old-forge
+      run: |
+        version="${{ steps.old-version.outputs.old_version }}"
+        echo "Installing Forge $version"
+        
+        # Download precompiled binary
+        if curl -sSfL -o foundry.tar.gz "https://github.com/foundry-rs/foundry/releases/download/$version/foundry_nightly_linux.tar.gz"; then
+          tar xzf foundry.tar.gz
+          chmod +x forge
+          ./forge --version
+          echo "forge_path=$(pwd)/forge" >> $GITHUB_OUTPUT
+        else
+          # Build from source if binary not available
+          echo "Binary not found, building from source..."
+          git clone https://github.com/foundry-rs/foundry.git foundry-old
+          cd foundry-old
+          git checkout $version
+          cargo build --release --bin forge
+          echo "forge_path=$(pwd)/target/release/forge" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Setup latest Forge
+      uses: foundry-rs/foundry-toolchain@v1
+      with:
+        version: latest
+
+    - name: Prepare workspaces
+      run: |
+        cp -R solady solady-old
+        cp -R solady solady-new
+
+    - name: Run benchmarks concurrently
+      id: benchmarks
+      run: |
+        # Function to time forge build
+        time_forge() {
+          dir=$1
+          forge_cmd=$2
+          prefix=$3
+          
+          cd "$dir"
+          start=$(date +%s.%N)
+          $forge_cmd build --force
+          end=$(date +%s.%N)
+          time=$(echo "$end - $start" | bc)
+          echo "${prefix}_time=$time" >> $GITHUB_OUTPUT
+        }
+        
+        # Run benchmarks in background
+        (time_forge "solady-old" "${{ steps.setup-old-forge.outputs.forge_path }}" "old") &
+        (time_forge "solady-new" "forge" "new") &
+        
+        # Wait for both to finish
+        wait
+
+    - name: Display results
+      run: |
+        # Calculate percentage difference
+        difference=$(echo "scale=2; (${{ steps.benchmarks.outputs.new_time }} - ${{ steps.benchmarks.outputs.old_time }}) * 100 / ${{ steps.benchmarks.outputs.old_time }}" | bc)
+        
+        # Format results
+        echo "### ⚖️ Forge Compile Time Comparison"
+        echo "| Version | Compile Time |"
+        echo "|---------|--------------|"
+        echo "| Old (${{ steps.old-version.outputs.old_version }}) | ${{ steps.benchmarks.outputs.old_time }}s |"
+        echo "| Latest | ${{ steps.benchmarks.outputs.new_time }}s |"
+        echo "| **Difference** | **$difference%** |"
+        echo ""
+        echo "Old version compile time: ${{ steps.benchmarks.outputs.old_time }} seconds"
+        echo "Latest version compile time: ${{ steps.benchmarks.outputs.new_time }} seconds"
