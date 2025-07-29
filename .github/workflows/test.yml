@@ -5,36 +5,105 @@ on:
   pull_request:
   workflow_dispatch:
 
-env:
-  FOUNDRY_PROFILE: ci
-
 jobs:
-  check:
-    name: Foundry project
+  compare-compile-times:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+
     steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
+    - name: Checkout Solady
+      uses: actions/checkout@v4
+      with:
+        repository: Vectorized/solady
+        path: solady
 
-      - name: Install Foundry
-        uses: foundry-rs/foundry-toolchain@v1
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y jq bc build-essential libssl-dev pkg-config
 
-      - name: Show Forge version
-        run: |
-          forge --version
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        profile: minimal
+        override: true
 
-      - name: Run Forge fmt
-        run: |
-          forge fmt --check
-        id: fmt
+    - name: Get old Forge commit
+      id: old-commit
+      run: |
+        one_year_ago=$(date -d "1 year ago" +%Y-%m-%d)
+        commit=$(git ls-remote --tags https://github.com/foundry-rs/foundry | 
+                 awk '{print $2}' | 
+                 grep -Eo 'v[0-9]+\.[0-9]+\.[0-9]+' | 
+                 sort -V | 
+                 while read -r tag; do
+                   date=$(git log -1 --format=%ai "refs/tags/$tag^{}" 2>/dev/null)
+                   [[ -n "$date" ]] && echo "$(date -d "$date" +%s) $tag"
+                 done | 
+                 sort -n | 
+                 awk -v cutoff=$(date -d "$one_year_ago" +%s) '$1 <= cutoff {last=$2} END{print last}')
+        
+        if [ -z "$commit" ]; then
+          commit=$(git ls-remote https://github.com/foundry-rs/foundry main | cut -f1)
+        fi
+        
+        echo "old_commit=$commit" >> $GITHUB_OUTPUT
 
-      - name: Run Forge build
-        run: |
-          forge build --sizes
-        id: build
+    - name: Build old Forge
+      run: |
+        git clone https://github.com/foundry-rs/foundry.git foundry-old
+        cd foundry-old
+        git checkout ${{ steps.old-commit.outputs.old_commit }}
+        cargo build --release --bin forge
+        cp target/release/forge ../forge-old
 
-      - name: Run Forge tests
-        run: |
-          forge test -vvv
-        id: test
+    - name: Build new Forge
+      run: |
+        git clone https://github.com/foundry-rs/foundry.git foundry-new
+        cd foundry-new
+        cargo build --release --bin forge
+        cp target/release/forge ../forge-new
+
+    - name: Run benchmarks
+      id: benchmarks
+      run: |
+        cd solady
+        
+        # Run old Forge
+        start_old=$(date +%s.%N)
+        ../forge-old build --force
+        end_old=$(date +%s.%N)
+        old_time=$(echo "$end_old - $start_old" | bc)
+        
+        # Clean build artifacts
+        rm -rf out cache
+        
+        # Run new Forge
+        start_new=$(date +%s.%N)
+        ../forge-new build --force
+        end_new=$(date +%s.%N)
+        new_time=$(echo "$end_new - $start_new" | bc)
+        
+        # Format results
+        results=$(
+        cat <<EOF
+        | Forge Version | Compile Time |
+        |---------------|--------------|
+        | Old (${{ steps.old-commit.outputs.old_commit }}) | ${old_time}s |
+        | New (latest) | ${new_time}s |
+        | **Difference** | **$(echo "scale=3; ($new_time - $old_time)*100/$old_time" | bc)%** |
+        EOF
+        )
+        
+        echo "old_time=$old_time" >> $GITHUB_OUTPUT
+        echo "new_time=$new_time" >> $GITHUB_OUTPUT
+        echo "results<<EOF" >> $GITHUB_OUTPUT
+        echo "$results" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+
+    - name: Display results
+      run: |
+        echo -e "### ⚖️ Forge Compile Time Comparison\n${{ steps.benchmarks.outputs.results }}"
+        echo "Old version compile time: ${{ steps.benchmarks.outputs.old_time }} seconds"
+        echo "New version compile time: ${{ steps.benchmarks.outputs.new_time }} seconds"
