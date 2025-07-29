@@ -20,7 +20,6 @@ jobs:
       - name: Parse CSV and build matrix
         id: set-matrix
         run: |
-          echo "::group::Parsing forge_versions.csv"
           matrix=$(tail -n +2 forge_versions.csv | awk -F, '
             {
               gsub(/"/, "", $1);
@@ -31,27 +30,25 @@ jobs:
               seen[month] = url;
             }
             END {
-              print "[";
+              printf "[";
               count = 0;
-              for (month in seen) count++;
+              for (m in seen) count++;
               i = 0;
-              for (month in seen) {
-                printf "  {\"month\":\"%s\",\"url\":\"%s\"}", month, seen[month];
-                if (++i < count) print ",";
-                else print "";
+              for (m in seen) {
+                printf "{\"month\":\"%s\",\"url\":\"%s\"}", m, seen[m];
+                if (++i < count) printf ",";
               }
               print "]";
             }
           ')
-          
-          echo "Parsed matrix:"
-          echo "$matrix"
-          echo "$matrix" | jq . > /dev/null || { echo "❌ Invalid matrix JSON"; exit 1; }
-          
-          # GitHub Actions output (escaped for multiline JSON)
-          matrix_json="${matrix//$'\n'/}"
-          echo "matrix=$matrix_json" >> $GITHUB_OUTPUT
-          echo "::endgroup::"
+
+          # Validate JSON before output
+          echo "$matrix" | jq . > /dev/null || { echo "❌ Invalid JSON matrix"; exit 1; }
+
+          # Safe multiline output
+          echo "matrix<<EOF" >> $GITHUB_OUTPUT
+          echo "$matrix" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
 
   benchmark:
