@@ -1,0 +1,249 @@
+name: Forge Solidity Compile & Test Benchmark
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/forge-benchmark.yml
+      - forge_versions.csv
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/forge-benchmark.yml
+      - forge_versions.csv
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Parse forge_versions.csv
+        id: set-matrix
+        run: |
+          matrix=$(tail -n +2 forge_versions.csv | awk -F, '
+            {
+              gsub(/"/, "", $1);
+              gsub(/"/, "", $2);
+              split($1, d, "-");
+              month = d[1] "-" d[2];
+              seen[month] = $2;
+            }
+            END {
+              printf "[";
+              count = 0;
+              for (m in seen) count++;
+              i = 0;
+              for (m in seen) {
+                printf "{\"month\":\"%s\",\"url\":\"%s\"}", m, seen[m];
+                if (++i < count) printf ",";
+              }
+              print "]";
+            }
+          ')
+          echo "$matrix" | jq . > /dev/null || { echo "❌ Invalid JSON"; exit 1; }
+          echo "matrix<<EOF" >> $GITHUB_OUTPUT
+          echo "$matrix" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+  benchmark:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    name: Benchmark ${{ matrix.month }}
+    steps:
+      - name: Clone Solady repo
+        uses: actions/checkout@v4
+        with:
+          repository: Vectorized/solady
+          path: solady
+
+      - name: Download forge version for ${{ matrix.month }}
+        run: |
+          curl -L "${{ matrix.url }}" -o forge.tar.gz
+          mkdir -p forge-bin
+          tar -xzf forge.tar.gz -C forge-bin
+          chmod +x forge-bin/forge
+          echo "$(pwd)/forge-bin" >> $GITHUB_PATH
+
+      - name: Benchmark forge build
+        id: build-benchmark
+        working-directory: solady
+        run: |
+          # Clean any existing build artifacts
+          rm -rf out cache
+          
+          # Warm up run
+          forge build > /dev/null 2>&1
+          rm -rf out cache
+          
+          # Actual benchmark
+          start=$(date +%s%3N)
+          forge build > /dev/null 2>&1
+          end=$(date +%s%3N)
+          build_duration=$((end - start))
+          echo "build_duration=$build_duration" >> $GITHUB_OUTPUT
+
+      - name: Benchmark forge test
+        id: test-benchmark
+        working-directory: solady
+        run: |
+          # Run tests to measure execution time
+          start=$(date +%s%3N)
+          forge test > /dev/null 2>&1 || true
+          end=$(date +%s%3N)
+          test_duration=$((end - start))
+          echo "test_duration=$test_duration" >> $GITHUB_OUTPUT
+
+      - name: Save benchmark results
+        run: |
+          echo "${{ matrix.month }},${{ steps.build-benchmark.outputs.build_duration }},${{ steps.test-benchmark.outputs.test_duration }}" > result.csv
+          cat result.csv
+
+      - name: Upload benchmark result
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-benchmark-${{ matrix.month }}
+          path: result.csv
+
+  aggregate-results:
+    needs: benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: forge-benchmark-*
+          merge-multiple: true
+
+      - name: Aggregate results
+        id: aggregate
+        run: |
+          # Create header
+          echo "Month,Build Time (ms),Test Time (ms)" > all_results.csv
+          
+          # Sort and merge all result files
+          for file in result.csv*; do
+            if [ -f "$file" ]; then
+              cat "$file" >> all_results.csv
+            fi
+          done
+          
+          # Sort by month
+          (head -n 1 all_results.csv && tail -n +2 all_results.csv | sort) > sorted_results.csv
+          
+          # Generate markdown table
+          echo "## 📊 Forge Benchmark Results" > benchmark_report.md
+          echo "" >> benchmark_report.md
+          echo "### Solady Repository Compilation and Test Times" >> benchmark_report.md
+          echo "" >> benchmark_report.md
+          echo "| Month | Build Time (ms) | Test Time (ms) | Total Time (ms) |" >> benchmark_report.md
+          echo "|-------|-----------------|----------------|-----------------|" >> benchmark_report.md
+          
+          tail -n +2 sorted_results.csv | while IFS=',' read -r month build_time test_time; do
+            total_time=$((build_time + test_time))
+            printf "| %-10s | %,15d | %,14d | %,15d |\n" "$month" "$build_time" "$test_time" "$total_time" >> benchmark_report.md
+          done
+          
+          # Calculate statistics
+          echo "" >> benchmark_report.md
+          echo "### 📈 Summary Statistics" >> benchmark_report.md
+          echo "" >> benchmark_report.md
+          
+          # Build time stats
+          build_avg=$(tail -n +2 sorted_results.csv | awk -F',' '{sum+=$2; count++} END {printf "%.0f", sum/count}')
+          build_min=$(tail -n +2 sorted_results.csv | awk -F',' 'NR==1 || $2<min {min=$2} END {print min}')
+          build_max=$(tail -n +2 sorted_results.csv | awk -F',' 'NR==1 || $2>max {max=$2} END {print max}')
+          
+          # Test time stats
+          test_avg=$(tail -n +2 sorted_results.csv | awk -F',' '{sum+=$3; count++} END {printf "%.0f", sum/count}')
+          test_min=$(tail -n +2 sorted_results.csv | awk -F',' 'NR==1 || $3<min {min=$3} END {print min}')
+          test_max=$(tail -n +2 sorted_results.csv | awk -F',' 'NR==1 || $3>max {max=$3} END {print max}')
+          
+          echo "**Build Times:**" >> benchmark_report.md
+          printf "- Average: %'d ms\n" "$build_avg" >> benchmark_report.md
+          printf "- Minimum: %'d ms\n" "$build_min" >> benchmark_report.md
+          printf "- Maximum: %'d ms\n" "$build_max" >> benchmark_report.md
+          echo "" >> benchmark_report.md
+          echo "**Test Times:**" >> benchmark_report.md
+          printf "- Average: %'d ms\n" "$test_avg" >> benchmark_report.md
+          printf "- Minimum: %'d ms\n" "$test_min" >> benchmark_report.md
+          printf "- Maximum: %'d ms\n" "$test_max" >> benchmark_report.md
+          
+          # Generate performance trend
+          echo "" >> benchmark_report.md
+          echo "### 📉 Performance Trend" >> benchmark_report.md
+          echo "" >> benchmark_report.md
+          echo "```" >> benchmark_report.md
+          echo "Build Time Trend (normalized to 100 for readability):" >> benchmark_report.md
+          tail -n +2 sorted_results.csv | awk -F',' -v max="$build_max" '{
+            normalized = int(($2 / max) * 100)
+            printf "%-10s [", $1
+            for(i=0; i<normalized; i+=2) printf "█"
+            printf "] %d ms\n", $2
+          }' >> benchmark_report.md
+          echo "```" >> benchmark_report.md
+          
+          # Save report for artifact
+          cp benchmark_report.md benchmark_report_artifact.md
+
+      - name: Comment PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('benchmark_report.md', 'utf8');
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            
+            const botComment = comments.find(comment => 
+              comment.user.type === 'Bot' && 
+              comment.body.includes('📊 Forge Benchmark Results')
+            );
+            
+            if (botComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: report
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: report
+              });
+            }
+
+      - name: Upload final report
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: |
+            sorted_results.csv
+            benchmark_report_artifact.md
+
+      - name: Job Summary
+        run: |
+          cat benchmark_report.md >> $GITHUB_STEP_SUMMARY
